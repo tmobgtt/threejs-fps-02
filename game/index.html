@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YARDLINE — a three.js tactical FPS</title>
+<link rel="stylesheet" href="./src/style.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three/three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud" class="hidden">
+  <div id="flash"></div>
+  <div id="damage-vignette"></div>
+  <div id="damage-dir"></div>
+  <div id="scope"><div id="scope-ring"></div></div>
+
+  <div id="crosshair">
+    <span class="ch-line ch-t"></span><span class="ch-line ch-b"></span>
+    <span class="ch-line ch-l"></span><span class="ch-line ch-r"></span>
+    <span class="ch-dot"></span>
+  </div>
+  <div id="hitmarker"><span></span><span></span><span></span><span></span></div>
+
+  <div id="topbar">
+    <div id="team-atk" class="team-box">
+      <div class="team-name">VULTURES</div>
+      <div class="pips" id="pips-atk"></div>
+    </div>
+    <div id="clock-box">
+      <div id="score-line"><span id="score-atk">0</span><span id="score-sep">:</span><span id="score-def">0</span></div>
+      <div id="timer">1:40</div>
+      <div id="round-label">ROUND 1</div>
+    </div>
+    <div id="team-def" class="team-box">
+      <div class="team-name">WARDENS</div>
+      <div class="pips" id="pips-def"></div>
+    </div>
+  </div>
+  <div id="bomb-state"></div>
+  <div id="killfeed"></div>
+
+  <div id="bottom-left">
+    <div id="health-row">
+      <div id="health-num">100</div>
+      <div id="health-track"><div id="health-fill"></div><div id="armor-fill"></div></div>
+    </div>
+    <div id="armor-row">ARMOR <span id="armor-num">0</span></div>
+  </div>
+
+  <div id="bottom-right">
+    <div id="money">$800</div>
+    <div id="weapon-name">SIDEARM</div>
+    <div id="ammo"><span id="ammo-mag">12</span><span id="ammo-sep">/</span><span id="ammo-res">120</span></div>
+    <div id="grenades"></div>
+  </div>
+
+  <div id="hint"></div>
+  <div id="channel" class="hidden">
+    <div id="channel-label">PLANTING</div>
+    <div id="channel-track"><div id="channel-fill"></div></div>
+  </div>
+  <div id="banner" class="hidden"><div id="banner-main"></div><div id="banner-sub"></div></div>
+
+  <div id="buy-menu" class="hidden">
+    <div id="buy-head"><span>BUY EQUIPMENT</span><span id="buy-money">$800</span></div>
+    <div id="buy-grid"></div>
+    <div id="buy-foot">Number keys or click to buy &nbsp;·&nbsp; B or Esc to close &nbsp;·&nbsp; round starts when the timer ends</div>
+  </div>
+
+  <div id="scoreboard" class="hidden">
+    <div class="sb-title">YARDLINE — SWITCHYARD</div>
+    <div id="sb-rows"></div>
+  </div>
+</div>
+
+<div id="menu">
+  <div id="menu-card">
+    <div id="menu-kicker">A THREE.JS TACTICAL FPS</div>
+    <h1>YARDLINE</h1>
+    <p id="menu-blurb">Four Vultures carry the charge into the switchyard. Four Wardens
+    hold the sites. Plant it, defuse it, or be the last one standing — and mind
+    your money: the yard pays the careful.</p>
+    <button id="play-btn">DEPLOY</button>
+    <div id="controls">
+      <span><b>WASD</b> move</span><span><b>Mouse</b> look</span><span><b>Click</b> fire</span>
+      <span><b>R</b> reload</span><span><b>Shift</b> walk</span><span><b>Ctrl</b> crouch</span>
+      <span><b>Space</b> jump</span><span><b>1 2 3 4</b> weapons</span><span><b>B</b> buy</span>
+      <span><b>E</b> plant / interact</span><span><b>Tab</b> scores</span>
+    </div>
+  </div>
+</div>
+
+<div id="matchover" class="hidden">
+  <div id="match-card">
+    <div id="match-result">VICTORY</div>
+    <div id="match-score"></div>
+    <button id="again-btn">PLAY AGAIN</button>
+  </div>
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
