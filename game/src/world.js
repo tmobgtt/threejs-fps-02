@@ -386,17 +386,16 @@ export function findPath(W, fromIdx, toIdx, out) {
   const prev = _prev;
   prev.fill(-1);
   const queue = _queue;
-  queue.length = 0;
-  queue.push(fromIdx);
+  let qHead = 0, qTail = 0;
+  queue[qTail++] = fromIdx;
   prev[fromIdx] = fromIdx;
-  let head = 0;
-  while (head < queue.length) {
-    const cur = queue[head++];
+  while (qHead < qTail) {
+    const cur = queue[qHead++];
     if (cur === toIdx) break;
     for (const nb of W.edges[cur]) {
       if (prev[nb] === -1) {
         prev[nb] = cur;
-        queue.push(nb);
+        queue[qTail++] = nb;
       }
     }
   }

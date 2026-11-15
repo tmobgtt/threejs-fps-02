@@ -35,16 +35,16 @@ scene.background = new THREE.Color(INK.sky);
 scene.fog = new THREE.Fog(INK.fog, 42, 135);
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 300);
 
-const sun = new THREE.DirectionalLight(0xffb37a, 1.5);
+const sun = new THREE.DirectionalLight(0xffb37a, 1.9);
 sun.position.set(34, 42, -20);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(1024, 1024);
 sun.shadow.camera.left = -46; sun.shadow.camera.right = 46;
 sun.shadow.camera.top = 36; sun.shadow.camera.bottom = -36;
 sun.shadow.camera.far = 130;
 sun.shadow.bias = -0.0006;
 scene.add(sun);
-scene.add(new THREE.HemisphereLight(0x93a7c9, 0x55483a, 0.85));
+scene.add(new THREE.HemisphereLight(0x93a7c9, 0x55483a, 1.1));
 
 const W = buildWorld(scene);
 for (const [lx, lz] of W.lampHeads) {
@@ -1005,6 +1005,9 @@ function render(dt) {
 // ---------------------------------------------------------------- boot + loop
 const params = new URLSearchParams(location.search);
 G.director = params.get("autoplay") === "1";
+// A play-test aid: ?timescale=N fast-forwards the fixed-step simulation
+// (used to stage screenshots and soak-test rounds on slow machines).
+const TIMESCALE = Math.max(1, Math.min(20, Number(params.get("timescale") ?? 1) || 1));
 
 // place everyone at their spawns for the menu backdrop
 {
@@ -1044,15 +1047,16 @@ function frame(ts) {
   requestAnimationFrame(frame);
   let delta = (ts - lastTs) / 1000;
   lastTs = ts;
-  if (delta > 0.12) delta = 0.12;
-  acc += delta;
+  if (delta > 0.25) delta = 0.25;
+  acc += delta * TIMESCALE;
+  const maxSteps = 5 * TIMESCALE;
   let steps = 0;
-  while (acc >= STEP && steps < 5) {
+  while (acc >= STEP && steps < maxSteps) {
     if (G.phase !== "menu" && G.phase !== "matchover") step(STEP);
     acc -= STEP;
     steps++;
   }
-  if (steps === 5) acc = 0;
+  if (steps === maxSteps) acc = 0;
   render(Math.min(delta, 0.05));
 }
 requestAnimationFrame(frame);

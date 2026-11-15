@@ -22,6 +22,10 @@ const types: Record<string, string> = {
 
 createServer((req, res) => {
   const path = normalize(decodeURIComponent((req.url ?? "/").split("?")[0]));
+  if (path === "/favicon.ico") {
+    res.writeHead(204).end();
+    return;
+  }
   const file = join(root, path === "/" ? "index.html" : path);
   if (!file.startsWith(root)) {
     res.writeHead(403).end("outside the yard");
