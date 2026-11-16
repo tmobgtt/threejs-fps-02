@@ -1,41 +1,35 @@
-// A tiny static file server for playing the game locally and for taking
-// its screenshots: node serve.ts [port] serves game/ at http://localhost.
-//
-// Standard library only. It sends the few MIME types the game uses and
-// never serves anything outside game/.
+// serve.ts - a tiny static server for playing TIDELINE locally.
+//   node serve.ts        then open http://localhost:8080
+// It serves only this repository's game/ folder, with the MIME types
+// ES modules and WebGL need, and answers /favicon.ico quietly.
 
-import { createServer } from "node:http";
-import { readFileSync, statSync } from "node:fs";
-import { dirname, extname, join, normalize } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "game");
-const port = Number(process.argv[2] ?? 8123);
-const types: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
+const root = join(fileURLToPath(new URL('.', import.meta.url)), 'game');
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
 };
 
-createServer((req, res) => {
-  const path = normalize(decodeURIComponent((req.url ?? "/").split("?")[0]));
-  if (path === "/favicon.ico") {
-    res.writeHead(204).end();
-    return;
-  }
-  const file = join(root, path === "/" ? "index.html" : path);
-  if (!file.startsWith(root)) {
-    res.writeHead(403).end("outside the yard");
-    return;
-  }
+createServer(async (req, res) => {
   try {
-    if (!statSync(file).isFile()) throw new Error("not a file");
-    res.writeHead(200, { "content-type": types[extname(file)] ?? "application/octet-stream" });
-    res.end(readFileSync(file));
+    let path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname);
+    if (path === '/favicon.ico') { res.writeHead(204); res.end(); return; }
+    if (path === '/') path = '/index.html';
+    const file = normalize(join(root, path));
+    if (!file.startsWith(root)) { res.writeHead(403); res.end(); return; }
+    const body = await readFile(file);
+    res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'application/octet-stream' });
+    res.end(body);
   } catch {
-    res.writeHead(404).end("no such crate");
+    res.writeHead(404);
+    res.end('not found');
   }
-}).listen(port, () => console.log(`yardline served at http://localhost:${port}`));
+}).listen(8080, () => console.log('TIDELINE at http://localhost:8080'));

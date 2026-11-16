@@ -1,64 +1,108 @@
-// palette.js — the yard's colours and shared materials in one place.
-//
-// Dusk freight yard: warm sodium light on cool concrete. The Vultures wear
-// amber, the Wardens wear teal, and everything else stays desaturated so
-// players and sites read at a glance. Materials are cached by key so the
-// whole map shares a handful of programs.
+// palette.js - TIDELINE's art direction in one place.
+// Pier 9 at dawn: cold harbour blue and fog grey against signal orange,
+// with the two teams told apart by colour alone - Ember (attack) wears
+// burnt orange, Harbor (defence) wears steel blue. Every material the
+// world, characters and view models use comes from here, so the whole
+// scene shares one set of colours and one roughness language.
 
-import * as THREE from "three";
+import * as THREE from 'three';
 
-export const TEAMS = {
-  atk: { id: "atk", name: "VULTURES", color: 0xf2a33c, dark: 0x8a5a1d, light: 0xffcf87 },
-  def: { id: "def", name: "WARDENS", color: 0x3fb7ac, dark: 0x1f6f68, light: 0x9fe8df },
+export const PAL = {
+  // environment
+  sky: 0x2e4356,
+  fog: 0x8fa3b0,
+  dawn: 0xffb36b,
+  ground: 0x4a4d4f,
+  groundLine: 0xc8cdd0,
+  concrete: 0x9aa0a2,
+  concreteDark: 0x6d7276,
+  steel: 0x5b7183,
+  steelDark: 0x3c4c59,
+  rust: 0x9c5a36,
+  wood: 0x8a6a44,
+  woodDark: 0x6b5133,
+  containerBlue: 0x2f5d7a,
+  containerRed: 0x8c3f31,
+  containerGreen: 0x3f6b4f,
+  containerGrey: 0x707880,
+  coldroom: 0xb9c8cc,
+  glass: 0xa8c4cc,
+  hazard: 0xd8a722,
+  lampGlow: 0xffd9a0,
+  // teams
+  atk: 0xd96c27,
+  atkDark: 0x8f4517,
+  def: 0x3f6f9f,
+  defDark: 0x2a4c6e,
+  skin: 0xc9a186,
+  kitDark: 0x2c2f31,
+  // effects and HUD accents
+  tracerAtk: 0xffc37a,
+  tracerDef: 0x9fd0ff,
+  blood: 0x7a1f1f,
+  smoke: 0xb9c0c2,
+  flash: 0xffffff,
+  he: 0xff7a2e,
 };
 
-export const BOT_NAMES = {
-  atk: ["YOU", "MARLOWE", "IBARRA", "KESSEL"],
-  def: ["VANE", "OKONKWO", "PETROV", "LINDQVIST"],
-};
-
-export const INK = {
-  sky: 0x2b3444,
-  fog: 0x353d49,
-  ground: 0x565049,
-  groundDark: 0x453f38,
-  concrete: 0x7d7f7c,
-  concreteDark: 0x5b5d5c,
-  crate: 0x8a6b42,
-  crateAlt: 0x6e7b4f,
-  containerA: 0x9c4a2f,
-  containerB: 0x2f5d8a,
-  containerC: 0x707a3a,
-  wallTrim: 0xd8b25a,
-  sitePaint: 0xd8b25a,
-  metal: 0x494f57,
-  darkMetal: 0x2e3238,
-  lamp: 0xffc37a,
-  railSteel: 0x3a3f45,
-  white: 0xe8e2d4,
-};
-
+// Materials are shared, never built per object: the world is a few
+// hundred boxes but only a handful of distinct surfaces.
 const cache = new Map();
 
-// One Lambert material per (colour, flat) pair, reused by every mesh.
-export function mat(color, flat = false) {
-  const key = color * 2 + (flat ? 1 : 0);
+export function mat(color, rough = 0.9, metal = 0.0) {
+  const key = color + '|' + rough + '|' + metal;
   let m = cache.get(key);
   if (!m) {
-    m = new THREE.MeshLambertMaterial({ color });
-    if (flat) m.flatShading = true;
+    m = new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
     cache.set(key, m);
   }
   return m;
 }
 
-export function emissiveMat(color, intensity = 1) {
-  const key = `e${color}`;
-  let m = cache.get(key);
-  if (!m) {
-    m = new THREE.MeshBasicMaterial({ color });
-    m.userData.intensity = intensity;
-    cache.set(key, m);
+export function teamMat(team, dark = false) {
+  if (team === 'atk') return mat(dark ? PAL.atkDark : PAL.atk, 0.75);
+  return mat(dark ? PAL.defDark : PAL.def, 0.75);
+}
+
+// The ground is one big plane with a canvas texture painted by code:
+// asphalt, lane paint, the quay edge and the two site letters. Painting
+// it here keeps the map readable at a glance with no image assets.
+export function groundTexture() {
+  const c = document.createElement('canvas');
+  c.width = 1024; c.height = 768;
+  const g = c.getContext('2d');
+  g.fillStyle = '#4a4d4f';
+  g.fillRect(0, 0, 1024, 768);
+  // asphalt noise
+  for (let i = 0; i < 2600; i++) {
+    const x = Math.random() * 1024, y = Math.random() * 768;
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.05)';
+    g.fillRect(x, y, 2, 2);
   }
-  return m;
+  // world x -60..60 -> u 0..1024, z -44..44 -> v 0..768
+  const px = (x) => ((x + 60) / 120) * 1024;
+  const pz = (z) => ((z + 44) / 88) * 768;
+  // painted lane lines on the two roads
+  g.strokeStyle = 'rgba(216,167,34,0.55)';
+  g.lineWidth = 3;
+  g.setLineDash([18, 14]);
+  g.beginPath(); g.moveTo(px(-56), pz(-30)); g.lineTo(px(26), pz(-30)); g.stroke();
+  g.beginPath(); g.moveTo(px(-56), pz(30)); g.lineTo(px(28), pz(30)); g.stroke();
+  g.setLineDash([]);
+  // site letters, big and worn
+  g.fillStyle = 'rgba(217,108,39,0.8)';
+  g.font = 'bold 92px system-ui, sans-serif';
+  g.textAlign = 'center';
+  g.fillText('A', px(42), pz(-22));
+  g.fillStyle = 'rgba(63,111,159,0.85)';
+  g.fillText('B', px(44), pz(30));
+  // plant zone rings
+  g.strokeStyle = 'rgba(255,255,255,0.5)';
+  g.lineWidth = 4;
+  g.strokeRect(px(35), pz(-33), px(49) - px(35), pz(-17) - pz(-33));
+  g.strokeRect(px(37), pz(21), px(51) - px(37), pz(35) - pz(21));
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
 }

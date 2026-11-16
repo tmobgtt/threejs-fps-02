@@ -1,104 +1,91 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YARDLINE — a three.js tactical FPS</title>
+<title>TIDELINE - Pier 9 Tactical FPS</title>
 <link rel="stylesheet" href="./src/style.css">
 <script type="importmap">
 { "imports": { "three": "./vendor/three/three.module.min.js" } }
 </script>
 </head>
 <body>
-<div id="app"></div>
-
 <div id="hud" class="hidden">
-  <div id="flash"></div>
-  <div id="damage-vignette"></div>
-  <div id="damage-dir"></div>
-  <div id="scope"><div id="scope-ring"></div></div>
+  <div id="crosshair"><i class="c t"></i><i class="c b"></i><i class="c l"></i><i class="c r"></i><i class="dot"></i></div>
+  <div id="hitmarker"><i class="h tl"></i><i class="h tr"></i><i class="h bl"></i><i class="h br"></i></div>
 
-  <div id="crosshair">
-    <span class="ch-line ch-t"></span><span class="ch-line ch-b"></span>
-    <span class="ch-line ch-l"></span><span class="ch-line ch-r"></span>
-    <span class="ch-dot"></span>
+  <div id="topleft">
+    <canvas id="radar" width="176" height="138"></canvas>
+    <div id="plan"></div>
   </div>
-  <div id="hitmarker"><span></span><span></span><span></span><span></span></div>
 
   <div id="topbar">
-    <div id="team-atk" class="team-box">
-      <div class="team-name">VULTURES</div>
-      <div class="pips" id="pips-atk"></div>
-    </div>
-    <div id="clock-box">
-      <div id="score-line"><span id="score-atk">0</span><span id="score-sep">:</span><span id="score-def">0</span></div>
-      <div id="timer">1:40</div>
-      <div id="round-label">ROUND 1</div>
-    </div>
-    <div id="team-def" class="team-box">
-      <div class="team-name">WARDENS</div>
-      <div class="pips" id="pips-def"></div>
-    </div>
+    <div class="side atk"><span class="sname" id="name-atk">EMBER</span><span class="score" id="score-atk">0</span></div>
+    <div id="clockbox"><div id="clock">1:45</div><div id="roundlabel">ROUND 1 / 12</div></div>
+    <div class="side def"><span class="score" id="score-def">0</span><span class="sname" id="name-def">HARBOR</span></div>
+    <div id="pips"></div>
   </div>
-  <div id="bomb-state"></div>
+
   <div id="killfeed"></div>
+  <div id="callouts"></div>
 
-  <div id="bottom-left">
-    <div id="health-row">
-      <div id="health-num">100</div>
-      <div id="health-track"><div id="health-fill"></div><div id="armor-fill"></div></div>
-    </div>
-    <div id="armor-row">ARMOR <span id="armor-num">0</span></div>
+  <div id="vitals">
+    <div class="bar hp"><div id="hpfill"></div><span id="hptext">100</span></div>
+    <div class="bar armor"><div id="armorfill"></div><span id="armortext"></span></div>
+    <div id="kitind"></div>
   </div>
 
-  <div id="bottom-right">
+  <div id="weaponbox">
     <div id="money">$800</div>
-    <div id="weapon-name">SIDEARM</div>
-    <div id="ammo"><span id="ammo-mag">12</span><span id="ammo-sep">/</span><span id="ammo-res">120</span></div>
-    <div id="grenades"></div>
+    <div id="wepname">P9 Sidearm</div>
+    <div id="ammo"><span id="mag">12</span> <span id="reserve">/ 48</span></div>
+    <div id="slots"></div>
+    <div id="bombind"></div>
   </div>
 
-  <div id="hint"></div>
-  <div id="channel" class="hidden">
-    <div id="channel-label">PLANTING</div>
-    <div id="channel-track"><div id="channel-fill"></div></div>
-  </div>
   <div id="banner" class="hidden"><div id="banner-main"></div><div id="banner-sub"></div></div>
+  <div id="progress" class="hidden"><div id="progress-label">PLANTING</div><div id="progress-track"><div id="progress-fill"></div></div></div>
+  <div id="spectate" class="hidden"></div>
+  <div id="dmgdir"><i></i></div>
 
-  <div id="buy-menu" class="hidden">
-    <div id="buy-head"><span>BUY EQUIPMENT</span><span id="buy-money">$800</span></div>
-    <div id="buy-grid"></div>
-    <div id="buy-foot">Number keys or click to buy &nbsp;·&nbsp; B or Esc to close &nbsp;·&nbsp; round starts when the timer ends</div>
+  <div id="buymenu" class="hidden">
+    <div class="buy-head"><span>BUY EQUIPMENT</span><span id="buy-money"></span><span class="buy-hint">B or ESC to close - number keys buy</span></div>
+    <div id="buygrid"></div>
   </div>
 
   <div id="scoreboard" class="hidden">
-    <div class="sb-title">YARDLINE — SWITCHYARD</div>
-    <div id="sb-rows"></div>
+    <div class="sb-head">TIDELINE - PIER 9</div>
+    <div id="sb-cols"></div>
   </div>
 </div>
 
-<div id="menu">
-  <div id="menu-card">
-    <div id="menu-kicker">A THREE.JS TACTICAL FPS</div>
-    <h1>YARDLINE</h1>
-    <p id="menu-blurb">Four Vultures carry the charge into the switchyard. Four Wardens
-    hold the sites. Plant it, defuse it, or be the last one standing — and mind
-    your money: the yard pays the careful.</p>
-    <button id="play-btn">DEPLOY</button>
-    <div id="controls">
-      <span><b>WASD</b> move</span><span><b>Mouse</b> look</span><span><b>Click</b> fire</span>
-      <span><b>R</b> reload</span><span><b>Shift</b> walk</span><span><b>Ctrl</b> crouch</span>
-      <span><b>Space</b> jump</span><span><b>1 2 3 4</b> weapons</span><span><b>B</b> buy</span>
-      <span><b>E</b> plant / interact</span><span><b>Tab</b> scores</span>
+<div id="flashfx"></div>
+<div id="hurtfx"></div>
+<div id="scopefx" class="hidden"><div class="scope-h"></div><div class="scope-v"></div></div>
+
+<div id="startscreen">
+  <div class="ss-inner">
+    <div class="ss-kicker">PIER 9 FREIGHT TERMINAL - DAWN</div>
+    <h1>TIDELINE</h1>
+    <p class="ss-sub">A round-based tactical FPS. Ember attacks, Harbor defends.
+    Plant the charge at the Coldstore or the Crane Dock, or wipe the other crew.
+    Win the round, earn, buy better guns. First crew to 7 rounds takes the pier.</p>
+    <div class="ss-cols">
+      <div>
+        <h3>MOVE</h3>
+        <p>WASD move - Mouse aim - Shift walk (quiet)<br>Ctrl / C crouch - Space jump<br>Stop moving to shoot straight</p>
+      </div>
+      <div>
+        <h3>FIGHT</h3>
+        <p>Click fire - R reload - Right mouse aim / scope<br>1 2 3 weapons - 4 5 6 grenades - E plant / defuse<br>B buy menu - Tab scoreboard</p>
+      </div>
+      <div>
+        <h3>ROUND</h3>
+        <p>12 rounds, sides swap at 6. Headshots pay 4x.<br>Wooden crates can be shot through.<br>Smoke blocks sight - even the bots'.</p>
+      </div>
     </div>
-  </div>
-</div>
-
-<div id="matchover" class="hidden">
-  <div id="match-card">
-    <div id="match-result">VICTORY</div>
-    <div id="match-score"></div>
-    <button id="again-btn">PLAY AGAIN</button>
+    <div id="startbtn">CLICK TO PLAY</div>
+    <div class="ss-note">Headphones recommended. All sound is synthesized live; the map, names and art are original.</div>
   </div>
 </div>
 

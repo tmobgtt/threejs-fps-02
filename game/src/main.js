@@ -1,1062 +1,615 @@
-// main.js — YARDLINE: the match itself.
-//
-// Wires the modules together and owns the rules: the round phase machine
-// (buy -> live -> planted -> over), the economy, the bomb, channels for
-// planting and defusing, and the one combat path every shooter uses —
-// player and bots alike — so a headshot means the same thing from any
-// gun. The simulation runs on a fixed 60 Hz step; rendering only reads
-// the state the step leaves behind.
+// main.js - TIDELINE's conductor.
+// Boots three.js, builds the world and the ten combatants, then runs a
+// fixed-step simulation (60 Hz, accumulator, rendering interpolated by
+// the frame itself) that owns the round state machine: buy, live,
+// planted, over - with the halftime side swap, the economy payouts,
+// bomb plant / defuse / detonation, spectating after death, and the
+// director mode (?autoplay=1) that lets a bot drive the player so the
+// game's own systems can be watched and photographed.
 
-import * as THREE from "three";
-import { buildWorld, hasLOS, inSite, nearestNode, findPath } from "./world.js";
-import { INK, TEAMS, BOT_NAMES } from "./palette.js";
-import { SoundBank } from "./audio.js";
-import { Input } from "./input.js";
-import { G, CFG, REWARD, resetMatch, aliveCount, roundPay } from "./state.js";
-import { Effects } from "./effects.js";
+import * as THREE from 'three';
+import { G, TEAM_NAMES, PAY, lossStreak, lossPay, payActor, makeActor, aliveOf, resetMatch, resetBomb } from './state.js';
+import { buildWorld, SPAWNS, SITES, siteAt, nodes } from './world.js';
+import { mat } from './palette.js';
+import { initAudio, resumeAudio } from './audio.js';
+import { initInput, mouse, consumeMouse, down, takePress, clearPresses } from './input.js';
+import { initEffects, updateEffects, setFxCamera, smokeClouds, fxExplosion } from './effects.js';
 import {
-  WEAPONS, GRENADES, Gun, spreadFor, applyDamage, traceShot, ThrowableSim, bodyHeight,
-} from "./weapon.js";
-import { Player } from "./player.js";
-import { Bot } from "./bots.js";
-import { Hud } from "./hud.js";
+  WEAPONS, NADES, hooks, resetLoadout, currentItem, heldNade, tryFire, startReload,
+  throwGrenade, updateWeapons, updateProjectiles, clearProjectiles, initNades, buyItem, botBuy, viewDir,
+} from './weapon.js';
+import { createBody, syncBody, controlPlayer, buildViewModel, syncViewModel, updateCamera, stepPhysics } from './player.js';
+import { makeBrain, updateBot, assignRoles } from './bots.js';
+import * as HUD from './hud.js';
+import * as SFX from './audio.js';
 
-// ---------------------------------------------------------------- setup
-const app = document.getElementById("app");
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+const STEP = 1 / 60;
+const params = new URLSearchParams(location.search);
+const AUTOPLAY = params.has('autoplay');
+const TIMESCALE = Math.min(20, Math.max(0.25, Number(params.get('timescale') || 1)));
+const STAGE = params.get('stage');
+const rng = Math.random;
+
+// ---- renderer / scene -------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-app.appendChild(renderer.domElement);
+renderer.domElement.className = 'webgl';
+document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(INK.sky);
-scene.fog = new THREE.Fog(INK.fog, 42, 135);
-const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 300);
+const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, 0.08, 420);
+scene.add(camera);
+buildWorld(scene);
+initEffects(scene);
+initNades(scene);
+setFxCamera(camera);
+buildViewModel(camera);
 
-const sun = new THREE.DirectionalLight(0xffb37a, 1.9);
-sun.position.set(34, 42, -20);
-sun.castShadow = true;
-sun.shadow.mapSize.set(1024, 1024);
-sun.shadow.camera.left = -46; sun.shadow.camera.right = 46;
-sun.shadow.camera.top = 36; sun.shadow.camera.bottom = -36;
-sun.shadow.camera.far = 130;
-sun.shadow.bias = -0.0006;
-scene.add(sun);
-scene.add(new THREE.HemisphereLight(0x93a7c9, 0x55483a, 1.1));
-
-const W = buildWorld(scene);
-for (const [lx, lz] of W.lampHeads) {
-  const lamp = new THREE.PointLight(0xffc37a, 30, 24, 1.9);
-  lamp.position.set(lx, 5.1, lz);
-  scene.add(lamp);
+// site alert lights: dark until the charge is planted, then pulsing red
+const alertLights = {};
+for (const k of ['A', 'B']) {
+  const l = new THREE.PointLight(0xff3524, 0, 34, 1.5);
+  l.position.set(SITES[k].cx, 4.2, SITES[k].cz);
+  scene.add(l);
+  alertLights[k] = l;
 }
-
-const effects = new Effects(scene);
-const sound = new SoundBank();
-const input = new Input(renderer.domElement);
-const hud = new Hud();
-const throwables = new ThrowableSim(scene);
-
-const player = new Player(scene, camera);
-G.player = player;
-const bots = [];
-for (let i = 1; i < 4; i++) bots.push(new Bot(scene, "atk", BOT_NAMES.atk[i]));
-for (let i = 0; i < 4; i++) bots.push(new Bot(scene, "def", BOT_NAMES.def[i]));
-G.combatants = [player, ...bots];
-
-// The bomb prop: a charge case with a blinking light, visible when it is
-// dropped or planted.
+// the charge itself: a dark box with a blinking tell-tale
 const bombMesh = new THREE.Group();
 {
-  const caseMesh = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.2, 0.36),
-    new THREE.MeshLambertMaterial({ color: 0x2e3238 }));
-  caseMesh.position.y = 0.1;
-  bombMesh.add(caseMesh);
-  const lightMesh = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.05, 0.08),
-    new THREE.MeshBasicMaterial({ color: 0xe5484d }));
-  lightMesh.position.set(0.14, 0.22, 0);
-  bombMesh.add(lightMesh);
-  bombMesh.visible = false;
+  const box = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.2, 0.13), mat(0x23272a, 0.5, 0.4));
+  box.castShadow = true;
+  bombMesh.add(box);
+  const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 6),
+    new THREE.MeshStandardMaterial({ color: 0xff3524, emissive: 0xff3524, emissiveIntensity: 2 }));
+  lamp.position.set(0.1, 0.12, 0);
+  bombMesh.add(lamp);
+  bombMesh.userData.lamp = lamp;
   scene.add(bombMesh);
 }
-G.bomb = { state: "carried", carrier: player, x: 0, y: 0, z: 0, site: null, fuseT: 0 };
 
-const noises = []; // { x, z, at, radius, team }
-let attackSite = W.sites.A;
-let intel = null; // { site, at } — defenders' last word on the bomb
-const DEF_POSTS = [
-  { x: -13.5, z: -19 }, { x: -25, z: -9 }, // site A pair
-  { x: 17, z: 9.5 }, { x: 26.5, z: 18.5 }, // site B pair
+// ---- cast ---------------------------------------------------------------------
+const player = makeActor('atk', 'YOU', true);
+player.pos = new THREE.Vector3(); player.vel = new THREE.Vector3();
+G.player = player;
+const CAST = [
+  ['atk', 'Vex', 0.55], ['atk', 'Rook', 0.7], ['atk', 'Sable', 0.45], ['atk', 'Iona', 0.62],
+  ['def', 'Cato', 0.6], ['def', 'Wren', 0.5], ['def', 'Hollis', 0.72], ['def', 'Marsh', 0.48], ['def', 'Vane', 0.66],
 ];
-const ATK_STAGE = {
-  A: { x: -13, z: -6 }, B: { x: 10, z: 6 },
-};
-
-// ---------------------------------------------------------------- helpers
-const _v1 = new THREE.Vector3();
-const _v2 = new THREE.Vector3();
-const _v3 = new THREE.Vector3();
-const _hit = { kind: "none", target: null, part: "body", dist: 0, x: 0, y: 0, z: 0 };
-const _right = new THREE.Vector3();
-const _up2 = new THREE.Vector3();
-const _upAxis = new THREE.Vector3(0, 1, 0);
-const BLAST_DEF = { damage: 0, headMult: 1, rangeFull: 1e9, dmgFar: 1 };
-
-function gauss() { return (Math.random() + Math.random() + Math.random() - 1.5) / 1.5; }
-function wrapPi(a) {
-  while (a > Math.PI) a -= Math.PI * 2;
-  while (a < -Math.PI) a += Math.PI * 2;
-  return a;
+for (const [team, name, skill] of CAST) {
+  const a = makeActor(team, name, false);
+  a.pos = new THREE.Vector3(); a.vel = new THREE.Vector3();
+  makeBrain(a, skill);
 }
-function viewDir(c, out) {
-  const cp = Math.cos(c.pitch);
-  out.set(-Math.sin(c.yaw) * cp, Math.sin(c.pitch), -Math.cos(c.yaw) * cp);
-  return out;
-}
-function eyeOf(c, out) { return out.set(c.pos.x, c.eyeY(), c.pos.z); }
-function distToPlayer(x, z) { return Math.hypot(x - player.pos.x, z - player.pos.z); }
-
-function pushNoise(x, z, radius, team) {
-  noises.push({ x, z, at: G.time, radius, team });
-  if (noises.length > 24) noises.shift();
+if (AUTOPLAY) makeBrain(player, 0.62);
+for (const a of G.actors) {
+  createBody(a, scene);
+  if (a.isPlayer) a.body.grp.visible = false;
+  resetLoadout(a);
 }
 
-// ---------------------------------------------------------------- damage
-function hurt(target, def, part, dist, attacker) {
-  if (!target.alive) return;
-  const dealt = applyDamage(target, def, part, dist);
-  if (target.channelRole) cancelChannel();
-  if (target.isPlayer) {
-    sound.hurt();
-    let bearing = null;
-    if (attacker) {
-      const yawTo = Math.atan2(-(attacker.pos.x - target.pos.x), -(attacker.pos.z - target.pos.z));
-      bearing = -wrapPi(yawTo - target.yaw);
-    }
-    hud.hurt(bearing);
-    G.shake = Math.min(0.5, G.shake + 0.12);
+// ---- combat hooks ---------------------------------------------------------------
+let hurtT = 0;
+let spectateTarget = null;
+hooks.onDamage = (attacker, target, dmg, zone) => {
+  if (target.isPlayer && attacker && attacker !== target) {
+    const ang = Math.atan2(-(attacker.pos.x - target.pos.x), -(attacker.pos.z - target.pos.z));
+    HUD.damageFrom(ang, target.yaw);
+    hurtT = 0.35;
+    SFX.sfxHurt();
   }
-  if (target.hp <= 0) kill(target, attacker, part);
-  return dealt;
-}
-
-function kill(target, attacker, part) {
+  if (attacker && attacker.isPlayer) HUD.showHitmarker(zone === 'head', false);
+};
+hooks.onKill = (attacker, target, key, head) => {
   target.alive = false;
-  target.hp = 0;
   target.deaths++;
-  if (target.channelRole) cancelChannel();
   if (attacker && attacker !== target) {
     attacker.kills++;
-    if (attacker.isPlayer) G.money = Math.min(CFG.maxMoney, G.money + REWARD.kill);
-    else attacker.money = Math.min(CFG.maxMoney, attacker.money + REWARD.kill);
+    payActor(attacker, PAY.kill);
+    if (attacker.isPlayer) { SFX.sfxKill(); HUD.showHitmarker(head, true); }
   }
-  const aName = attacker ? attacker.name : "THE YARD";
-  const aCls = attacker ? (attacker.team === "atk" ? "k-atk" : "k-def") : "";
-  const tCls = target.team === "atk" ? "k-atk" : "k-def";
-  hud.feed(`<span class="${aCls}">${aName}</span> ▸ <span class="${tCls}">${target.name}</span>${part === "head" ? " ⌖" : ""}`);
-  if (attacker && attacker.isPlayer) {
-    hud.hitmarker(part === "head");
-    sound.hit(part === "head");
-    sound.kill();
-  }
-  if (target.hasBomb) dropBomb(target);
-}
-
-function dropBomb(carrier) {
-  carrier.hasBomb = false;
-  G.bomb.state = "dropped";
-  G.bomb.carrier = null;
-  G.bomb.x = carrier.pos.x;
-  G.bomb.y = carrier.pos.y;
-  G.bomb.z = carrier.pos.z;
-  bombMesh.position.set(G.bomb.x, G.bomb.y, G.bomb.z);
-  bombMesh.visible = true;
-}
-
-// ---------------------------------------------------------------- shooting
-function performShot(shooter, aimTarget = null) {
-  const gun = shooter.gun;
-  const def = gun.def;
-  const t = G.time;
-  if (!gun.ready(t)) return false;
-  gun.fire(t);
-  const eye = eyeOf(shooter, _v1);
-  let dir;
-  if (shooter.isPlayer) {
-    dir = viewDir(shooter, _v2);
-  } else if (aimTarget) {
-    const h = bodyHeight(aimTarget);
-    const aimY = aimTarget.pos.y + (Math.random() < 0.22 ? h - 0.23 : h * 0.62);
-    dir = _v2.set(aimTarget.pos.x - eye.x, aimY - eye.y, aimTarget.pos.z - eye.z).normalize();
-    // a small lead: bots aim where a moving target is going, imperfectly
-    dir.x += aimTarget.vel.x * 0.012;
-    dir.z += aimTarget.vel.z * 0.012;
-    dir.normalize();
-  } else {
-    dir = viewDir(shooter, _v2);
-  }
-  if (def.kind === "melee") {
-    traceShot(W, G.combatants, shooter, eye, dir, def.range, _hit);
-    sound.throwIt();
-    if (_hit.kind === "target") {
-      effects.hitPuff(_hit.x, _hit.y, _hit.z, _hit.part === "head");
-      hurt(_hit.target, def, _hit.part, _hit.dist, shooter);
-    }
-    return true;
-  }
-  const spread = spreadFor(def, shooter) + (shooter.isPlayer ? 0 : shooter.aimErr);
-  // perturb the direction inside the cone (scratch vectors, no allocation)
-  _right.crossVectors(dir, _upAxis).normalize();
-  _up2.crossVectors(_right, dir).normalize();
-  dir.addScaledVector(_right, gauss() * spread)
-    .addScaledVector(_up2, gauss() * spread)
-    .normalize();
-  traceShot(W, G.combatants, shooter, eye, dir, def.range, _hit);
-
-  // muzzle point + tracer + sound
-  let mx = eye.x + dir.x * 0.5, my = eye.y - 0.12 + dir.y * 0.5, mz = eye.z + dir.z * 0.5;
-  if (shooter.isPlayer) {
-    player.viewModel.muzzleWorld(_v3);
-    mx = _v3.x; my = _v3.y; mz = _v3.z;
-    player.viewModel.fire();
-    shooter.pitch += def.id === "sniper" ? 0.045 : def.id === "pistol" ? 0.013 : 0.009;
-    shooter.yaw += gauss() * 0.0022;
-    G.shake = Math.min(0.4, G.shake + (def.id === "sniper" ? 0.22 : 0.05));
-  }
-  effects.muzzle(mx, my, mz, def.id === "sniper" ? 3.4 : 2.0);
-  if (_hit.dist > 1.2) effects.tracer(mx, my, mz, _hit.x, _hit.y, _hit.z, shooter.team === "atk" ? 0xffd9a0 : 0xa0e8ff);
-  sound.shot(def.id, shooter.isPlayer ? 0 : distToPlayer(shooter.pos.x, shooter.pos.z));
-  pushNoise(shooter.pos.x, shooter.pos.z, def.id === "sniper" ? 46 : 34, shooter.team);
-
-  if (_hit.kind === "world") {
-    effects.impact(_hit.x, _hit.y, _hit.z);
-  } else if (_hit.kind === "target") {
-    effects.hitPuff(_hit.x, _hit.y, _hit.z, _hit.part === "head");
-    if (shooter.isPlayer) {
-      hud.hitmarker(_hit.part === "head");
-      sound.hit(_hit.part === "head");
-    }
-    hurt(_hit.target, def, _hit.part, _hit.dist, shooter);
-  }
-  if (def.id === "sniper") sound.boltCycle();
-  return true;
-}
-
-function performThrow(shooter, kind) {
-  const eye = eyeOf(shooter, _v1);
-  const dir = viewDir(shooter, _v2);
-  eye.addScaledVector(dir, 0.4);
-  throwables.throwIt(kind, eye, dir, shooter.isPlayer ? 13.5 : 11.5, shooter);
-  sound.throwIt();
-  pushNoise(shooter.pos.x, shooter.pos.z, 8, shooter.team);
-}
-
-// ---------------------------------------------------------------- channels
-function startChannel(who, kind) {
-  if (G.channel || !who.alive) return false;
-  if (kind === "plant" && (!who.hasBomb || G.bomb.state !== "carried")) return false;
-  if (kind === "defuse" && G.bomb.state !== "planted") return false;
-  const dur = kind === "plant" ? CFG.plantTime : who.hasKit ? CFG.defuseKitTime : CFG.defuseTime;
-  G.channel = { kind, who, t: 0, dur, beeped: 0 };
-  who.channelRole = kind;
-  return true;
-}
-
-function cancelChannel() {
-  if (!G.channel) return;
-  G.channel.who.channelRole = null;
-  G.channel = null;
-  hud.setChannel(null);
-}
-
-function stepChannel(dt) {
-  const ch = G.channel;
-  if (!ch) return;
-  const who = ch.who;
-  const valid = who.alive &&
-    (ch.kind === "plant"
-      ? who.hasBomb && (inSite(W.sites.A, who.pos.x, who.pos.z) || inSite(W.sites.B, who.pos.x, who.pos.z))
-      : Math.hypot(G.bomb.x - who.pos.x, G.bomb.z - who.pos.z) < 2.3);
-  if (!valid || (who.isPlayer && !playerWantsChannel)) {
-    cancelChannel();
-    return;
-  }
-  ch.t += dt;
-  const frac = ch.t / ch.dur;
-  if (ch.kind === "plant") {
-    const mark = Math.floor(frac * 4);
-    if (mark > ch.beeped) { ch.beeped = mark; sound.plantBeep(false); }
-  } else if (who.isPlayer || who.team === "def") {
-    if (Math.random() < dt * 6) sound.defuseWire();
-  }
-  if (who.isPlayer) hud.setChannel(frac, ch.kind === "plant" ? "PLANTING THE CHARGE" : "DEFUSING");
-  if (ch.t >= ch.dur) {
-    const kind = ch.kind;
-    cancelChannel();
-    if (kind === "plant") plantBomb(who);
-    else endRound("def", "defuse");
-  }
-}
-
-function plantBomb(who) {
-  const site = inSite(W.sites.A, who.pos.x, who.pos.z) ? W.sites.A : W.sites.B;
-  who.hasBomb = false;
-  G.bomb.state = "planted";
-  G.bomb.carrier = null;
-  G.bomb.x = who.pos.x;
-  G.bomb.y = who.pos.y;
-  G.bomb.z = who.pos.z;
-  G.bomb.site = site;
-  G.bomb.fuseT = CFG.fuseTime;
-  bombMesh.position.set(G.bomb.x, G.bomb.y, G.bomb.z);
-  bombMesh.visible = true;
-  G.phase = "planted";
-  G.phaseT = CFG.fuseTime;
-  if (who.isPlayer) G.money = Math.min(CFG.maxMoney, G.money + REWARD.plant);
-  else who.money = Math.min(CFG.maxMoney, who.money + REWARD.plant);
-  sound.plantDone();
-  pushNoise(G.bomb.x, G.bomb.z, 26, "atk");
-  hud.showBanner("CHARGE PLANTED", `Site ${site.id} — ${CFG.fuseTime} seconds to detonation`, 2400);
-}
-
-// ---------------------------------------------------------------- economy
-const BUY_ITEMS = [
-  { id: "smg", key: "1", label: "KESTREL SMG", price: 1500 },
-  { id: "rifle", key: "2", label: "LONGARM RIFLE", price: 2700 },
-  { id: "sniper", key: "3", label: "SURVEYOR SNIPER", price: 4300 },
-  { id: "armor", key: "4", label: "KEVLAR VEST", price: 650 },
-  { id: "armorhelm", key: "5", label: "VEST + HELMET", price: 1000 },
-  { id: "he", key: "6", label: "HE GRENADE", price: 300 },
-  { id: "flash", key: "7", label: "FLASHBANG", price: 200 },
-  { id: "smoke", key: "8", label: "SMOKE GRENADE", price: 300 },
-];
-
-function buyStateFor(c, money) {
-  return BUY_ITEMS.map((it) => {
-    let owned = false;
-    if (it.id === "armor") owned = c.armor >= 100 && !c.helmet;
-    else if (it.id === "armorhelm") owned = c.armor >= 100 && c.helmet;
-    else if (it.id in GRENADES) owned = c.grenades[it.id] >= (it.id === "flash" ? 2 : 1);
-    else owned = !!(c.weapons.primary && c.weapons.primary.def.id === it.id);
-    return { ...it, owned, cant: money < it.price && !owned };
+  G.killfeed.push({
+    killer: attacker ? attacker.name : 'THE PIER',
+    killerTeam: attacker ? attacker.team : target.team,
+    victim: target.name, victimTeam: target.team,
+    weapon: (WEAPONS[key] && WEAPONS[key].name) || (NADES[key] && NADES[key].name) || key,
+    head, t: G.time,
   });
-}
-
-function applyBuy(c, id, spend) {
-  if (id === "armor" || id === "armorhelm") {
-    spend(id === "armor" ? 650 : 1000);
-    c.armor = 100;
-    if (id === "armorhelm") c.helmet = true;
-    return true;
+  if (target.hasBomb) {
+    target.hasBomb = false;
+    G.bomb.carrier = null;
+    G.bomb.droppedAt = { x: target.pos.x, y: 0, z: target.pos.z };
+    G.callouts.push({ team: target.team, text: 'The charge is down!', t: G.time });
   }
-  if (id in GRENADES) {
-    spend(GRENADES[id].price);
-    c.grenades[id]++;
-    return true;
-  }
-  spend(WEAPONS[id].price);
-  c.giveWeapon(id);
-  return true;
-}
-
-function playerBuy(id) {
-  const item = BUY_ITEMS.find((i) => i.id === id);
-  if (!item) return;
-  const state = buyStateFor(player, G.money).find((i) => i.id === id);
-  if (state.owned || G.money < item.price) { sound.buyNo(); return; }
-  applyBuy(player, id, (p) => { G.money -= p; });
-  sound.buyOk();
-  refreshBuyMenu();
-}
-
-function refreshBuyMenu() {
-  hud.renderBuy(buyStateFor(player, G.money), G.money, playerBuy);
-  hud.setMoney(G.money);
-}
-
-function botBuy(bot) {
-  const spend = (p) => { bot.money -= p; };
-  const roll = Math.random();
-  if (bot.money >= 4950 && roll < 0.16) applyBuy(bot, "sniper", spend);
-  else if (bot.money >= 3350 && roll < 0.75) applyBuy(bot, "rifle", spend);
-  else if (bot.money >= 2150 && roll < 0.9) applyBuy(bot, "smg", spend);
-  if (bot.armor < 100 && bot.money >= 1000) applyBuy(bot, "armorhelm", spend);
-  else if (bot.armor < 100 && bot.money >= 650) applyBuy(bot, "armor", spend);
-  if (bot.team === "def" && !bot.hasKit && bot.money >= 400 && Math.random() < 0.55) {
-    bot.money -= 400;
-    bot.hasKit = true;
-  }
-  if (bot.money > 700 && Math.random() < 0.4) applyBuy(bot, "flash", spend);
-  if (bot.money > 900 && Math.random() < 0.25) applyBuy(bot, "he", spend);
-  if (bot.money > 900 && Math.random() < 0.18) applyBuy(bot, "smoke", spend);
-  if (bot.weapons.primary) bot.equip(bot.weapons.primary.def.id);
-}
-
-// ---------------------------------------------------------------- bot env
-const env = {
-  W, G, time: 0, enemies: [], combatants: G.combatants, smokes: G.smokes, noises,
-  attackSite: null,
-  attackSiteGoal(bot) {
-    if (G.bomb.state === "dropped") return { x: G.bomb.x, z: G.bomb.z };
-    const stage = ATK_STAGE[attackSite.id];
-    const carrier = G.bomb.carrier;
-    if (carrier && Math.hypot(carrier.pos.x - attackSite.x, carrier.pos.z - attackSite.z) < 13) {
-      return { x: attackSite.x, z: attackSite.z };
-    }
-    return stage;
-  },
-  defendGoal(bot) { return bot.post || DEF_POSTS[0]; },
-  startChannel(who, kind) { startChannel(who, kind); },
-  onReload() {},
-  onThrow(bot, kind, targetPos) {
-    // bots throw from their eye toward the target's feet, lobbed
-    const eye = eyeOf(bot, new THREE.Vector3());
-    const dir = new THREE.Vector3(targetPos.x - eye.x, 0.5, targetPos.z - eye.z).normalize();
-    throwables.throwIt(kind, eye, dir, 11, bot);
-    sound.throwIt();
-  },
-  onShoot(bot, enemy) { performShot(bot, enemy); },
+  if (target.isPlayer) spectateTarget = null;
 };
 
-// ---------------------------------------------------------------- rounds
-function shuffle(a) {
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = (Math.random() * (i + 1)) | 0;
-    [a[i], a[j]] = [a[j], a[i]];
+// ---- round / match flow -----------------------------------------------------------
+let planHistory = [];
+let defuseCalled = false;
+let playerChannelT = 0;
+let beepT = 0;
+let stageApplied = false;
+let stageHoldPlayer = false;
+
+function sideToSquad(side) { return (side === 'atk') !== G.swapped ? 'ember' : 'harbor'; }
+
+function pickPlan() {
+  let site = rng() < 0.5 ? 'A' : 'B';
+  if (planHistory.length >= 2 && planHistory[planHistory.length - 1] === site && planHistory[planHistory.length - 2] === site) {
+    site = site === 'A' ? 'B' : 'A';
   }
-  return a;
+  planHistory.push(site);
+  return site;
 }
 
-function startMatch() {
-  resetMatch();
-  for (const c of G.combatants) {
-    c.kills = 0;
-    c.deaths = 0;
-    c.money = CFG.startMoney;
-    c.lostKit = true;
+function doSwap() {
+  G.swapped = true;
+  for (const a of G.actors) {
+    a.team = a.team === 'atk' ? 'def' : 'atk';
+    scene.remove(a.body.grp);
+    createBody(a, scene);
+    if (a.isPlayer) a.body.grp.visible = false;
+    resetLoadout(a);
+    a.money = 800;
   }
-  G.money = CFG.startMoney;
-  startRound();
+  lossStreak.atk = 0; lossStreak.def = 0;
+  G.score.atk = 0; G.score.def = 0;
 }
 
 function startRound() {
-  G.round++;
-  G.phase = "buy";
-  G.phaseT = CFG.buyTime;
+  if (G.round === 6 && !G.swapped) doSwap();
+  resetBomb();
+  clearProjectiles();
+  smokeClouds.length = 0;
+  G.events.length = 0;
   G.channel = null;
-  G.smokes = [];
-  env.smokes = G.smokes;
-  noises.length = 0;
-  throwables.clear();
-  intel = null;
-  attackSite = Math.random() < 0.5 ? W.sites.A : W.sites.B;
-  env.attackSite = attackSite;
-
-  // the bomb starts on the player's back every round
-  G.bomb.state = "carried";
-  G.bomb.carrier = player;
-  G.bomb.site = null;
-  bombMesh.visible = false;
-
-  const atkSpawns = shuffle([...W.spawns.atk]);
-  const defSpawns = shuffle([...W.spawns.def]);
-  let ai = 0, di = 0;
-  G.combatants.forEach((c, idx) => {
-    const spawn = c.team === "atk" ? atkSpawns[ai++ % 4] : defSpawns[di++ % 4];
-    if (c.lostKit) {
-      // died last round: back to a fresh sidearm and empty pockets
-      c.weapons.primary = null;
-      c.weapons.pistol = new Gun(WEAPONS.pistol);
-      c.armor = 0;
-      c.helmet = false;
-      c.grenades = { he: 0, flash: 0, smoke: 0 };
-      c.hasKit = false;
+  defuseCalled = false;
+  playerChannelT = 0;
+  const byTeam = { atk: 0, def: 0 };
+  for (const a of G.actors) {
+    const idx = byTeam[a.team]++;
+    const [sx, sz] = SPAWNS[a.team][idx % SPAWNS[a.team].length];
+    a.pos.set(sx, 0, sz);
+    a.vel.set(0, 0, 0);
+    a.yaw = a.team === 'atk' ? -Math.PI / 2 : Math.PI / 2;
+    a.pitch = 0; a.punchP = 0; a.punchY = 0;
+    a.crouch = false; a.ads = false;
+    a.hp = 100; a.alive = true;
+    a.hasBomb = false; // last round's carrier must not keep the flag
+    a.tagT = 0; a.flashT = 0; a.lastHitT = -9;
+    if (a._diedLast) { resetLoadout(a); a._diedLast = false; }
+    else {
+      const it = currentItem(a);
+      if (it) { it.reloadEnd = 0; it.nextAt = 0; it.bloom = 0; }
     }
-    c.alive = true;
-    c.hp = 100;
-    c.deaths = c.deaths || 0;
-    c.hasBomb = false;
-    c.channelRole = null;
-    c.blindT = 0;
-    if (c.isPlayer) {
-      c.placeAt(spawn);
-      c.equip(c.weapons.primary ? c.weapons.primary.def.id : "pistol");
-    } else {
-      c.pos.set(spawn.x, 0, spawn.z);
-      c.vel.set(0, 0, 0);
-      c.yaw = spawn.yaw;
-      c.deadT = 0;
-      c.state = "route";
-      c.path = [];
-      c.goal = null;
-      c.memory.enemy = null;
-      c.memory.at = -99;
-      c.mesh.visible = true;
-      c.equip(c.weapons.primary ? c.weapons.primary.def.id : "pistol");
-      botBuy(c);
-      c.syncMesh(0);
-    }
-    c.lostKit = false;
-    void idx;
+    if (a.brain) { a.brain.target = null; a.brain.seenT = -9; a.brain.channelT = 0; a.brain.hasDest = false; }
+  }
+  // the charge goes to a random attacker; the plan is called
+  const atks = aliveOf('atk');
+  const carrier = atks[Math.floor(rng() * atks.length)];
+  carrier.hasBomb = true;
+  G.bomb.carrier = carrier;
+  G.planSite = pickPlan();
+  assignRoles();
+  for (const a of G.actors) if (!a.isPlayer && a.brain) botBuy(a, rng);
+  G.phase = 'buy';
+  G.phaseT = 12;
+  G.callouts.push({
+    team: 'atk',
+    text: carrier.isPlayer ? 'You have the charge. Team plan: ' + (G.planSite === 'A' ? 'hit the Coldstore' : 'hit the Crane Dock')
+      : `${carrier.name} has the charge. Plan: ${G.planSite === 'A' ? 'hit the Coldstore' : 'hit the Crane Dock'}`,
+    t: G.time,
   });
-  player.hasBomb = true;
-
-  // defender posts: two per site, rotated by round
-  const defBots = bots.filter((b) => b.team === "def");
-  defBots.forEach((b, i) => {
-    b.post = DEF_POSTS[(i + G.round) % DEF_POSTS.length];
-    b.holdPos = null;
-  });
-
-  hud.show();
-  hud.setScore(G.score, G.round);
-  hud.showBanner(`ROUND ${G.round}`, `First to ${CFG.winsNeeded} — Vultures plant, Wardens hold`, 2200);
-  refreshBuyMenu();
-  hud.showBuy();
-  document.exitPointerLock?.();
+  HUD.showBanner(`ROUND ${G.round + 1}`, player.team === 'atk'
+    ? (G.planSite === 'A' ? 'PLANT AT THE COLDSTORE - OR WIPE THEM OUT' : 'PLANT AT THE CRANE DOCK - OR WIPE THEM OUT')
+    : 'HOLD THE SITES', 2.4);
+  if (STAGE === 'buy') HUD.setBuyOpen(true);
 }
 
-function endRound(winner, reason) {
-  if (G.phase === "over" || G.phase === "matchover") return;
-  cancelChannel();
-  G.phase = "over";
-  G.phaseT = CFG.roundEndTime;
-  G.roundWinner = winner;
-  G.roundReason = reason;
-  G.score[winner]++;
-  const { winPay, lossPay } = roundPay(winner, reason);
-  const playerWon = winner === player.team;
-  G.money = Math.min(CFG.maxMoney, G.money + (playerWon ? winPay : lossPay));
-  for (const b of bots) b.money = Math.min(CFG.maxMoney, b.money + (b.team === winner ? winPay : lossPay));
-  for (const c of G.combatants) if (!c.alive) c.lostKit = true;
-  const reasonText = {
-    elimination: "Team eliminated",
-    detonate: "The charge went off",
-    defuse: "The charge was defused",
-    timeout: "The clock ran out",
-  }[reason];
-  hud.showBanner(playerWon ? "ROUND WON" : "ROUND LOST",
-    `${reasonText} · +$${playerWon ? winPay : lossPay}`, 3600);
-  hud.setScore(G.score, G.round);
-  hud.hideBuy();
-  sound.roundEnd(playerWon);
-  if (reason === "detonate") {
-    effects.explosion(G.bomb.x, G.bomb.y + 0.4, G.bomb.z);
-    sound.explosion(distToPlayer(G.bomb.x, G.bomb.z));
-    G.shake = 1;
-    bombMesh.visible = false;
+function endRound(winnerSide, reason) {
+  if (G.phase === 'over' || G.phase === 'matchover') return;
+  const objective = reason.includes('CHARGE');
+  for (const a of G.actors) {
+    if (a.team === winnerSide) payActor(a, objective ? PAY.winObjective : PAY.winElim);
+    else payActor(a, lossPay(lossStreak[a.team] + 1));
+    a._diedLast = !a.alive;
   }
-}
-
-function endMatch() {
-  G.phase = "matchover";
-  G.winner = G.score.atk > G.score.def ? "atk" : "def";
-  const el = document.getElementById("matchover");
-  document.getElementById("match-result").textContent =
-    G.winner === "atk" ? "VULTURES TAKE THE YARD" : "WARDENS HOLD THE YARD";
-  document.getElementById("match-score").textContent =
-    `Final score ${G.score.atk} : ${G.score.def} — you went ${player.kills} / ${player.deaths}`;
-  el.classList.remove("hidden");
-  document.exitPointerLock?.();
-}
-
-// ---------------------------------------------------------------- grenades going off
-const nadeEvents = [];
-function stepGrenades(dt) {
-  nadeEvents.length = 0;
-  throwables.update(dt, W, nadeEvents);
-  for (const ev of nadeEvents) {
-    if (ev.type === "bounce") {
-      sound.bounce(distToPlayer(ev.pos.x, ev.pos.z));
-    } else if (ev.type === "smoke") {
-      effects.smoke(ev.pos.x, ev.pos.y + 1.1, ev.pos.z, GRENADES.smoke.duration);
-      G.smokes.push({ x: ev.pos.x, y: ev.pos.y + 1.2, z: ev.pos.z, r: GRENADES.smoke.radius, until: G.time + GRENADES.smoke.duration });
-      sound.burst({ dur: 0.3, freq: 900, gain: 0.2 });
-    } else if (ev.type === "explode" && ev.kind === "he") {
-      effects.explosion(ev.pos.x, ev.pos.y + 0.3, ev.pos.z);
-      sound.explosion(distToPlayer(ev.pos.x, ev.pos.z));
-      if (distToPlayer(ev.pos.x, ev.pos.z) < 7) G.shake = Math.min(1, G.shake + 0.4);
-      const def = GRENADES.he;
-      for (const c of G.combatants) {
-        if (!c.alive) continue;
-        const d = Math.hypot(c.pos.x - ev.pos.x, c.pos.z - ev.pos.z);
-        if (d > def.radius + 0.5) continue;
-        const blocked = !hasLOS(W, ev.pos.x, ev.pos.y + 0.4, ev.pos.z, c.pos.x, c.pos.y + 0.9, c.pos.z, null);
-        BLAST_DEF.damage = def.damage * Math.max(0.12, 1 - d / (def.radius + 0.5)) * (blocked ? 0.25 : 1);
-        hurt(c, BLAST_DEF, "body", 0, ev.owner);
-      }
-    } else if (ev.type === "explode" && ev.kind === "flash") {
-      effects.burst(ev.pos.x, ev.pos.y + 0.3, ev.pos.z, { count: 16, color: 0xffffff, speed: 3, life: 0.25, gravity: 0 });
-      sound.flashPop(distToPlayer(ev.pos.x, ev.pos.z));
-      const def = GRENADES.flash;
-      for (const c of G.combatants) {
-        if (!c.alive) continue;
-        const d = Math.hypot(c.pos.x - ev.pos.x, c.pos.z - ev.pos.z);
-        if (d > def.radius) continue;
-        if (!hasLOS(W, ev.pos.x, ev.pos.y + 0.4, ev.pos.z, c.pos.x, c.eyeY(), c.pos.z, null)) continue;
-        viewDir(c, _v3);
-        const toBlast = _v1.set(ev.pos.x - c.pos.x, 0, ev.pos.z - c.pos.z).normalize();
-        const facing = _v3.x * toBlast.x + _v3.z * toBlast.z;
-        const dur = facing > 0.55 ? 3.4 : facing > -0.1 ? 1.7 : 0.5;
-        c.blindT = Math.max(c.blindT, dur * (d < 6 ? 1 : 0.7));
-      }
-    }
+  lossStreak[winnerSide] = 0;
+  lossStreak[winnerSide === 'atk' ? 'def' : 'atk']++;
+  G.score[winnerSide]++;
+  G.squadScore[sideToSquad(winnerSide)]++;
+  G.roundLog.push(`R${G.round + 1}: ${winnerSide} - ${reason}`);
+  G.round++;
+  const playerWon = player.team === winnerSide;
+  SFX.sfxRound(playerWon);
+  const decided = G.squadScore.ember >= G.winsNeeded || G.squadScore.harbor >= G.winsNeeded || G.round >= G.maxRounds;
+  if (reason === 'CHARGE DETONATED' && G.bomb.pos) {
+    fxExplosion(G.bomb.pos.x, 0.6, G.bomb.pos.z, G.time);
+    SFX.sfxExplosion(4);
   }
-  // prune spent smokes
-  for (let i = G.smokes.length - 1; i >= 0; i--) {
-    if (G.time > G.smokes[i].until) G.smokes.splice(i, 1);
-  }
-}
-
-// ---------------------------------------------------------------- player actions
-let prevFiring = false;
-let grenadeInHand = null; // kind selected with slot 4
-let lastWeaponId = "pistol";
-let playerWantsChannel = false;
-let scopeKickT = 0;
-
-function currentGrenadeKind() {
-  for (const kind of ["he", "flash", "smoke"]) if (player.grenades[kind] > 0) return kind;
-  return null;
-}
-
-function playerStep(dt) {
-  const t = G.time;
-  // build the movement command: real input, or the director's brain
-  const cmd = { mx: 0, mz: 0, walk: false, crouch: false, jump: false, lookDX: 0, lookDY: 0 };
-  let wantsFire = false;
-  playerWantsChannel = false;
-  if (G.director) {
-    directorThink(dt, cmd);
-    wantsFire = directorState.fire;
-    playerWantsChannel = directorState.plant;
+  if (decided) {
+    G.phase = 'matchover';
+    G.over = true;
+    const emberWon = G.squadScore.ember > G.squadScore.harbor;
+    const playerSquadWon = (sideToSquad(player.team) === 'ember') === emberWon;
+    G.winner = emberWon ? 'ember' : 'harbor';
+    SFX.sfxMatch(playerSquadWon);
+    HUD.showBanner(G.squadScore.ember === G.squadScore.harbor ? 'MATCH DRAWN' : playerSquadWon ? 'MATCH WON' : 'MATCH LOST',
+      `EMBER ${G.squadScore.ember} - ${G.squadScore.harbor} HARBOR - PRESS ENTER TO PLAY AGAIN`, 30);
   } else {
-    const [dx, dy] = input.takeMouse();
-    cmd.lookDX = dx;
-    cmd.lookDY = dy;
-    cmd.mx = (input.down("KeyD") ? 1 : 0) - (input.down("KeyA") ? 1 : 0);
-    cmd.mz = (input.down("KeyW") ? 1 : 0) - (input.down("KeyS") ? 1 : 0);
-    cmd.walk = input.down("ShiftLeft") || input.down("ShiftRight");
-    cmd.crouch = input.down("ControlLeft") || input.down("ControlRight") || input.down("KeyC");
-    cmd.jump = input.down("Space");
-    wantsFire = input.firing;
-  }
-  player.update(dt, cmd, W);
-  if (player.stepped) {
-    player.stepped = false;
-    sound.step(0, !cmd.walk);
-    if (!cmd.walk && player.crouch01 < 0.5) pushNoise(player.pos.x, player.pos.z, 9, "atk");
-  }
-
-  const presses = G.director ? [] : input.takePresses();
-  const inBuy = G.phase === "buy";
-  for (const code of presses) {
-    if (inBuy && code.startsWith("Digit")) {
-      const item = BUY_ITEMS.find((i) => i.key === code.slice(5));
-      if (item) { playerBuy(item.id); continue; }
-    }
-    if (code === "KeyB" && inBuy) hud.buyOpen() ? hud.hideBuy() : (refreshBuyMenu(), hud.showBuy());
-    if (code === "KeyR" && player.alive) {
-      if (player.gun.startReload(t)) sound.reload();
-    }
-    if (code === "Digit1" && !inBuy) switchWeapon("primary");
-    if (code === "Digit2" && !inBuy) switchWeapon("pistol");
-    if (code === "Digit3" && !inBuy) switchWeapon("knife");
-    if (code === "Digit4" && !inBuy) {
-      const kind = currentGrenadeKind();
-      if (kind) {
-        lastWeaponId = player.active;
-        grenadeInHand = kind;
-        player.viewModel.set("grenade");
-      }
-    }
-    if (code === "KeyQ" && !inBuy) switchWeapon(lastWeaponId === "primary" ? "primary" : lastWeaponId);
-  }
-  const wheel = G.director ? 0 : input.takeWheel();
-  if (wheel !== 0 && !inBuy) switchWeapon(player.active === "pistol" ? "primary" : "pistol");
-
-  if (!player.alive) return;
-
-  // planting: hold E at a site with the bomb
-  const atSite = inSite(W.sites.A, player.pos.x, player.pos.z) || inSite(W.sites.B, player.pos.x, player.pos.z);
-  if (G.director) {
-    if (playerWantsChannel && !G.channel) startChannel(player, "plant");
-  } else if (input.down("KeyE") && player.hasBomb && atSite && G.phase === "live") {
-    playerWantsChannel = true;
-    if (!G.channel) startChannel(player, "plant");
-  }
-
-  // firing
-  const firingNow = wantsFire && (G.phase === "live" || G.phase === "planted");
-  if (grenadeInHand) {
-    if (firingNow && !prevFiring) {
-      performThrow(player, grenadeInHand);
-      player.grenades[grenadeInHand]--;
-      const back = lastWeaponId;
-      grenadeInHand = null;
-      switchWeapon(back === "primary" ? "primary" : back);
-    }
-  } else if (firingNow) {
-    const def = player.gun.def;
-    if (def.auto || !prevFiring) {
-      if (player.gun.dry(t)) {
-        if (!prevFiring) {
-          sound.dryFire();
-          if (player.gun.startReload(t)) sound.reload();
-        }
-      } else if (performShot(player)) {
-        if (def.id === "sniper") scopeKickT = 0.4;
-      }
-    }
-  }
-  prevFiring = firingNow;
-  if (scopeKickT > 0) scopeKickT -= dt;
-}
-
-function switchWeapon(which) {
-  grenadeInHand = null;
-  if (which === "primary") {
-    if (player.weapons.primary) {
-      lastWeaponId = player.active;
-      player.equip(player.weapons.primary.def.id);
-    }
-  } else if (which === "pistol" || which === "knife") {
-    lastWeaponId = player.active;
-    player.equip(which);
-  } else if (WEAPONS[which]) {
-    lastWeaponId = player.active;
-    player.equip(which);
+    G.phase = 'over';
+    G.phaseT = 5.5;
+    HUD.showBanner(playerWon ? 'ROUND WON' : 'ROUND LOST', `${reason} - ${playerWon ? '+' : ''}$${playerWon ? (objective ? PAY.winObjective : PAY.winElim) : lossPay(lossStreak[player.team])}`, 4.6);
   }
 }
 
-// ---------------------------------------------------------------- director (autoplay for screenshots)
-const directorState = {
-  fire: false, plant: false, thinkAt: 0, path: [], pathI: 0, goal: null, enemy: null,
-};
-const _dirPath = [];
-function directorThink(dt, cmd) {
-  const t = G.time;
-  if (t < directorState.thinkAt) return;
-  directorState.thinkAt = t + 0.12;
-  const ds = directorState;
-  ds.fire = false;
-  ds.plant = false;
-  // buy like a sensible player
-  if (G.phase === "buy") {
-    if (G.money >= 3350 && !player.weapons.primary) playerBuy("rifle");
-    else if (G.money >= 1000 && !player.helmet) playerBuy("armorhelm");
-    else if (G.money >= 650 && player.armor < 100) playerBuy("armor");
-    return;
-  }
-  // perceive: nearest visible enemy
-  const eye = eyeOf(player, _v1);
-  let best = null, bestD = Infinity;
-  for (const b of bots) {
-    if (b.team !== "def" || !b.alive) continue;
-    const d = Math.hypot(b.pos.x - player.pos.x, b.pos.z - player.pos.z);
-    if (d > 44 || d >= bestD) continue;
-    if (hasLOS(W, eye.x, eye.y, eye.z, b.pos.x, b.pos.y + 1.2, b.pos.z, G.smokes)) { best = b; bestD = d; }
-  }
-  ds.enemy = best;
-  // goal: the site while carrying, else follow the team in
-  let goal = null;
-  if (player.hasBomb) goal = { x: attackSite.x, z: attackSite.z };
-  else if (G.bomb.state === "dropped") goal = { x: G.bomb.x, z: G.bomb.z };
-  else goal = ATK_STAGE[attackSite.id];
-  if (player.hasBomb && (inSite(W.sites.A, player.pos.x, player.pos.z) || inSite(W.sites.B, player.pos.x, player.pos.z))) {
-    ds.plant = true;
-    ds.goal = null;
-    return;
-  }
-  if (!ds.goal || Math.hypot(goal.x - ds.goal.x, goal.z - ds.goal.z) > 3) {
-    ds.goal = goal;
-    const from = nearestNode(W, player.pos.x, player.pos.z);
-    const to = nearestNode(W, goal.x, goal.z);
-    findPath(W, from, to, _dirPath);
-    ds.path = _dirPath;
-    ds.pathI = 0;
-  }
-  let target = ds.path[ds.pathI] ? W.nodes[ds.path[ds.pathI]] : goal;
-  if (target && Math.hypot(target.x - player.pos.x, target.z - player.pos.z) < 1.2) {
-    ds.pathI++;
-    target = ds.path[ds.pathI] ? W.nodes[ds.path[ds.pathI]] : goal;
-  }
-  if (best) {
-    // face the enemy and shoot; movement handled below toward cover-ish strafe
-    const wantYaw = Math.atan2(-(best.pos.x - player.pos.x), -(best.pos.z - player.pos.z));
-    const err = wrapPi(wantYaw - player.yaw);
-    cmd.lookDX = -err / 0.0021 * 0.6;
-    const wantPitch = Math.atan2((best.pos.y + 1.1) - eye.y, bestD) ;
-    cmd.lookDY = -(wantPitch - player.pitch) / 0.0021 * 0.6;
-    if (Math.abs(err) < 0.06 && bestD < 40) ds.fire = true;
-    if (player.gun.mag === 0 && player.gun.startReload(t)) sound.reload();
-    cmd.mz = bestD > 20 ? 1 : 0;
-    cmd.mx = Math.sin(t * 0.8) > 0 ? 0.5 : -0.5;
-    return;
-  }
-  if (target) {
-    const wantYaw = Math.atan2(-(target.x - player.pos.x), -(target.z - player.pos.z));
-    const err = wrapPi(wantYaw - player.yaw);
-    cmd.lookDX = -err / 0.0021 * 0.6;
-    cmd.mz = Math.abs(err) < 1.2 ? 1 : 0.2;
+function startMatch() {
+  const wasSwapped = G.swapped;
+  resetMatch();
+  planHistory = [];
+  for (const a of G.actors) { resetLoadout(a); a._diedLast = false; }
+  if (wasSwapped) doSwapBack();
+  G.round = 0;
+  stageApplied = false;
+  stageHoldPlayer = false;
+  startRound();
+}
+function doSwapBack() {
+  // undo the halftime swap for a fresh match (teams flip back, quietly)
+  G.swapped = false;
+  for (const a of G.actors) {
+    a.team = a.team === 'atk' ? 'def' : 'atk';
+    scene.remove(a.body.grp);
+    createBody(a, scene);
+    if (a.isPlayer) a.body.grp.visible = false;
   }
 }
 
-// ---------------------------------------------------------------- the step
-function step(dt) {
+// ---- events from the bots ------------------------------------------------------
+function drainEvents() {
+  for (const ev of G.events) {
+    if (ev.type === 'planted' && !G.bomb.planted) {
+      const a = ev.actor;
+      G.bomb.planted = true;
+      G.bomb.site = ev.site;
+      G.bomb.pos = { x: a.pos.x, y: 0, z: a.pos.z };
+      G.bomb.carrier = null;
+      G.bomb.fuse = 40;
+      a.hasBomb = false;
+      G.bomb.planter = a;
+      payActor(a, PAY.plant);
+      for (const t of aliveOf('atk')) payActor(t, PAY.plantTeam);
+      G.phase = 'planted';
+      G.callouts.push({ team: 'atk', text: `${a.name}: charge planted, ${SITES[ev.site].name.toLowerCase()}`, t: G.time });
+      SFX.sfxPlantBeep(true);
+      if (player.team === 'def') HUD.showBanner('CHARGE PLANTED', `SITE ${ev.site} - RETAKE AND DEFUSE`, 2.6);
+      if (player.team === 'atk') HUD.showBanner('CHARGE PLANTED', 'DEFEND THE SITE', 2.2);
+    } else if (ev.type === 'defused') {
+      endRound('def', 'CHARGE DEFUSED');
+    }
+  }
+  G.events.length = 0;
+}
+
+// ---- staging for screenshots (real game states, arranged) -----------------------
+function applyStage() {
+  if (stageApplied || !STAGE) return;
+  stageApplied = true;
+  if (STAGE === 'planted') {
+    // arrange a genuine post-plant: charge down at A, player holding it,
+    // three attackers on the site, the defence about to retake
+    const give = (a, key) => { buyItem(a, key); };
+    player.money = 9000;
+    give(player, 'vk7'); give(player, 'helmet');
+    player.slot = 'primary';
+    player.pos.set(29.5, 0, -29);
+    player.yaw = -Math.PI / 2; // looking east across the site at the planter
+    stageHoldPlayer = true; // the camera stays composed; the fight comes to it
+    for (const a of G.actors) a.hasBomb = false;
+    G.bomb.carrier = null;
+    const vex = G.actors.find((a) => a.name === 'Vex');
+    vex.hasBomb = true;
+    const rook = G.actors.find((a) => a.name === 'Rook');
+    const sable = G.actors.find((a) => a.name === 'Sable');
+    vex.pos.set(35, 0, -28); rook.pos.set(48, 0, -16); sable.pos.set(28, 0, -13);
+    const nearNode = (x, z) => nodes.reduce((best, n) => {
+      const d = (n.x - x) ** 2 + (n.z - z) ** 2;
+      return !best || d < best.d ? { n, d } : best;
+    }, null).n;
+    for (const [a, nx, nz] of [[vex, 33, -24], [rook, 48, -15], [sable, 30, -19]]) {
+      a.brain.state = 'hold';
+      a.brain.post = nearNode(nx, nz);
+    }
+    G.events.push({ type: 'planted', actor: vex, site: 'A' });
+    G.phaseT = Math.min(G.phaseT, 90);
+  }
+}
+
+// ---- the player ------------------------------------------------------------------
+const _dir = new THREE.Vector3();
+const BUY_KEYS = ['sidekick', 'ripper', 'breacher', 'vk7', 'longshot', 'armor', 'helmet', 'kit', 'he', 'flash'];
+function playerActions(a, dt, m) {
+  // slot switching
+  const slots = ['primary', 'secondary', 'knife', 'he', 'flash', 'smoke'];
+  const codes = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6'];
+  for (let i = 0; i < slots.length; i++) {
+    if (takePress(codes[i])) {
+      const s = slots[i];
+      if (s === 'primary' && !a.inv.primary) continue;
+      if ((s === 'he' || s === 'flash' || s === 'smoke') && a.inv[s] <= 0) continue;
+      a.slot = s;
+      SFX.sfxScope(false);
+    }
+  }
+  if (takePress('KeyR')) startReload(a);
+  a.autoFiring = m.down;
+  viewDir(a, _dir);
+  const nade = heldNade(a);
+  if (nade) {
+    if (m.clicked) throwGrenade(a, nade, rng);
+    return;
+  }
+  if (m.down) {
+    const r = tryFire(a, _dir, rng, 1);
+    if (r === 'dry') startReload(a);
+  }
+  // plant / defuse channel on E
+  let channeling = false;
+  if (G.phase === 'live' && a.hasBomb && siteAt(a.pos.x, a.pos.z) && down('KeyE') && a.groundSpeed < 0.6) {
+    channeling = true;
+    playerChannelT += dt;
+    G.channel = { actor: a, label: 'PLANTING THE CHARGE', frac: playerChannelT / 3.2 };
+    if (playerChannelT >= 3.2) {
+      G.events.push({ type: 'planted', actor: a, site: siteAt(a.pos.x, a.pos.z) });
+      playerChannelT = 0;
+    }
+  } else if (G.phase === 'planted' && a.team === 'def' && G.bomb.pos
+    && Math.hypot(G.bomb.pos.x - a.pos.x, G.bomb.pos.z - a.pos.z) < 1.7 && down('KeyE') && a.groundSpeed < 0.6) {
+    channeling = true;
+    const need = a.hasKit ? 2.6 : 5.2;
+    playerChannelT += dt;
+    G.channel = { actor: a, label: 'DEFUSING THE CHARGE', frac: playerChannelT / need };
+    if (playerChannelT >= need) {
+      G.events.push({ type: 'defused', actor: a });
+      playerChannelT = 0;
+    }
+  }
+  if (!channeling) playerChannelT = Math.max(0, playerChannelT - dt * 3);
+  if (a.lastHitT > G.time - 0.8) playerChannelT = 0; // shot while working: start over
+}
+
+// ---- simulation step ---------------------------------------------------------------
+function simStep(dt, m) {
   G.time += dt;
-  env.time = G.time;
-  env.smokes = G.smokes;
+  G.channel = null;
+  drainEvents();
+  const phase = G.phase;
+  if (phase === 'buy' || phase === 'live' || phase === 'over') G.phaseT -= dt;
+  if (phase === 'planted') {
+    G.bomb.fuse -= dt;
+    beepT -= dt;
+    if (beepT <= 0) {
+      beepT = G.bomb.fuse > 12 ? 1 : G.bomb.fuse > 5 ? 0.5 : 0.24;
+      SFX.sfxPlantBeep(false);
+    }
+    if (G.bomb.fuse <= 0) endRound('atk', 'CHARGE DETONATED');
+  }
+  if (phase === 'buy' && G.phaseT <= 0) {
+    G.phase = 'live';
+    G.phaseT = 105;
+    HUD.setBuyOpen(false);
+    applyStage();
+  }
+  if (phase === 'live') {
+    if (aliveOf('def').length === 0) endRound('atk', 'TEAM ELIMINATED');
+    else if (aliveOf('atk').length === 0) endRound('def', 'TEAM ELIMINATED');
+    else if (G.phaseT <= 0) endRound('def', 'TIME EXPIRED');
+  }
+  if (phase === 'planted') {
+    if (aliveOf('def').length === 0) endRound('atk', 'TEAM ELIMINATED');
+  }
+  if (phase === 'over' && G.phaseT <= 0) startRound();
 
-  if (G.phase === "buy" || G.phase === "live" || G.phase === "planted" || G.phase === "over") {
-    G.phaseT -= dt;
+  // bomb pickup by walking over it
+  if (G.bomb.droppedAt && !G.bomb.planted) {
+    for (const a of aliveOf('atk')) {
+      if (Math.hypot(G.bomb.droppedAt.x - a.pos.x, G.bomb.droppedAt.z - a.pos.z) < 1.35) {
+        a.hasBomb = true;
+        G.bomb.carrier = a;
+        G.bomb.droppedAt = null;
+        if (a.isPlayer) SFX.sfxPickup();
+        break;
+      }
+    }
+  }
+  // a defender starting a defuse gets a callout, once per round
+  if (!defuseCalled && G.bomb.planted) {
+    const d = G.actors.find((x) => x.alive && x.team === 'def' && x.brain && x.brain.state === 'defuse');
+    if (d) {
+      defuseCalled = true;
+      G.callouts.push({ team: 'def', text: `${d.name}: defusing, cover me`, t: G.time });
+      SFX.sfxDefuse();
+    }
   }
 
-  if (G.phase === "buy" && G.phaseT <= 0) {
-    G.phase = "live";
-    G.phaseT = CFG.roundTime;
-    hud.hideBuy();
-    hud.showBanner("ROUND LIVE", "The yard is hot", 1400);
-    const lockReq = renderer.domElement.requestPointerLock?.();
-    if (lockReq && lockReq.catch) lockReq.catch(() => {});
-  }
-
-  if (G.phase === "over") {
-    for (const b of bots) if (!b.alive) b.update(dt, env); // let the fallen finish falling
-  }
-
-  if ((G.phase === "live" || G.phase === "planted") && player.alive) playerStep(dt);
-  else if (player.alive && G.phase === "buy") {
-    // look around during buy, no walking the yard yet
-    const cmd = { mx: 0, mz: 0, walk: false, crouch: false, jump: false, lookDX: 0, lookDY: 0 };
-    if (!G.director) {
-      const [dx, dy] = input.takeMouse();
-      cmd.lookDX = dx; cmd.lookDY = dy;
-      const presses = input.takePresses();
-      for (const code of presses) {
-        if (code.startsWith("Digit")) {
-          const item = BUY_ITEMS.find((i) => i.key === code.slice(5));
-          if (item) playerBuy(item.id);
-        }
-        if (code === "KeyB") hud.buyOpen() ? hud.hideBuy() : (refreshBuyMenu(), hud.showBuy());
+  const frozen = phase === 'over' || phase === 'matchover';
+  for (const a of G.actors) {
+    if (!a.alive) continue;
+    if (frozen) { stepPhysics(a, dt, 0, 0, 0, false); continue; }
+    if (a.isPlayer) {
+      if (AUTOPLAY && stageHoldPlayer) stepPhysics(a, dt, 0, 0, 0, false);
+      else if (AUTOPLAY) updateBot(a, dt, rng);
+      else if (phase === 'buy') {
+        // freeze time for the human too: look around, no walking
+        a.yaw -= m.dx * 0.0021;
+        a.pitch = Math.max(-1.45, Math.min(1.45, a.pitch - m.dy * 0.0021));
+        stepPhysics(a, dt, 0, 0, 0, false);
+      } else {
+        controlPlayer(a, dt, m);
+        if (phase === 'live' || phase === 'planted') playerActions(a, dt, m);
       }
     } else {
-      directorThink(dt, cmd);
+      updateBot(a, dt, rng);
     }
-    player.update(dt, cmd, W);
+    updateWeapons(a, dt);
   }
-  for (const c of G.combatants) c.gun.update(G.time, dt);
-
-  if (G.phase === "live" || G.phase === "planted") {
-    for (const b of bots) {
-      env.enemies = G.combatants.filter((c) => c.team !== b.team);
-      b.update(dt, env);
-      if (b.stepped) {
-        b.stepped = false;
-        sound.step(distToPlayer(b.pos.x, b.pos.z), true);
-        pushNoise(b.pos.x, b.pos.z, 8, b.team);
-      }
-    }
-    stepChannel(dt);
-    stepGrenades(dt);
-    // bomb pickup by a teammate walking over it
-    if (G.bomb.state === "dropped") {
-      for (const c of G.combatants) {
-        if (c.alive && c.team === "atk" && Math.hypot(c.pos.x - G.bomb.x, c.pos.z - G.bomb.z) < 1.1) {
-          c.hasBomb = true;
-          G.bomb.state = "carried";
-          G.bomb.carrier = c;
-          bombMesh.visible = false;
-          break;
-        }
-      }
-    }
-    // defenders who see the carrier give the team its rotation order
-    if (!intel && G.bomb.state === "carried") {
-      for (const b of bots) {
-        if (b.team === "def" && b.memory.enemy && b.memory.enemy.hasBomb) {
-          intel = { site: attackSite, at: G.time };
-          for (const d of bots) {
-            if (d.team !== "def") continue;
-            const nearA = Math.hypot(d.post.x - W.sites.A.x, d.post.z - W.sites.A.z) < 12;
-            const wantA = attackSite.id === "A";
-            if (nearA !== wantA) d.post = wantA ? { x: -16, z: -6 } : { x: 12, z: 4 };
-          }
-        }
-      }
-    }
-    // round-end checks
-    const atkAlive = aliveCount("atk");
-    const defAlive = aliveCount("def");
-    if (G.phase === "live") {
-      if (defAlive === 0) endRound("atk", "elimination");
-      else if (atkAlive === 0) endRound("def", "elimination");
-      else if (G.phaseT <= 0) endRound("def", "timeout");
-    } else if (G.phase === "planted") {
-      if (defAlive === 0) endRound("atk", "elimination");
-      else if (G.phaseT <= 0) endRound("atk", "detonate");
-    }
-  }
-
-  if (G.phase === "over" && G.phaseT <= 0) {
-    const decided = G.score.atk >= CFG.winsNeeded || G.score.def >= CFG.winsNeeded || G.round >= CFG.maxRounds;
-    if (decided) endMatch();
-    else startRound();
-  }
-
-  // prune old noise
-  for (let i = noises.length - 1; i >= 0; i--) {
-    if (G.time - noises[i].at > 2.5) noises.splice(i, 1);
-  }
-  if (bombMesh.visible && G.bomb.state === "planted") {
-    bombMesh.children[1].material.color.setHex(Math.sin(G.time * 9) > 0 ? 0xe5484d : 0x57151a);
-  }
+  if (!frozen) updateProjectiles(dt);
+  // prune stale noise
+  while (G.noise.length && G.time - G.noise[0].t > 3) G.noise.shift();
 }
 
-// ---------------------------------------------------------------- render
-let lastHudAmmo = "";
-function render(dt) {
-  // camera: the player's eyes, a teammate's eyes when dead, or a slow
-  // orbit of the yard behind the menu
-  if (G.phase === "menu") {
-    const t = performance.now() / 1000;
-    camera.position.set(Math.cos(t * 0.05) * 26, 13, Math.sin(t * 0.05) * 20);
-    camera.lookAt(0, 0, 0);
-    player.viewModel.group.visible = false;
-  } else if (player.alive) {
-    camera.position.set(player.pos.x, player.eyeY(), player.pos.z);
-    camera.rotation.order = "YXZ";
-    camera.rotation.y = player.yaw; // matches viewDir(): forward = (-sin yaw, ..., -cos yaw)
-    camera.rotation.x = player.pitch;
-    camera.rotation.z = 0;
-    if (G.shake > 0.003) {
-      camera.position.x += gauss() * G.shake * 0.05;
-      camera.position.y += gauss() * G.shake * 0.05;
-      camera.rotation.z = gauss() * G.shake * 0.01;
-      G.shake *= Math.pow(0.001, dt);
-    }
-    const scoped = player.active === "sniper" && input.aiming && !G.director && scopeKickT <= 0;
-    const targetFov = scoped ? 24 : 75;
-    if (Math.abs(camera.fov - targetFov) > 0.2) {
-      camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 14);
-      camera.updateProjectionMatrix();
-    }
-    hud.setScope(scoped);
-    player.viewModel.group.visible = !scoped;
-    const hSpeed = Math.hypot(player.vel.x, player.vel.z);
-    player.viewModel.update(dt, hSpeed, player.gun.reloading);
-  } else {
-    // spectate the first living teammate from just behind their shoulder
-    const mate = bots.find((b) => b.team === "atk" && b.alive) || bots.find((b) => b.alive);
-    if (mate) {
-      camera.position.set(mate.pos.x + Math.sin(mate.yaw) * 2.6, mate.eyeY() + 0.7, mate.pos.z + Math.cos(mate.yaw) * 2.6);
-      camera.lookAt(mate.pos.x - Math.sin(mate.yaw) * 6, mate.eyeY(), mate.pos.z - Math.cos(mate.yaw) * 6);
-    }
-    player.viewModel.group.visible = false;
-    hud.setScope(false);
-  }
-
-  // HUD numbers
-  if (G.phase !== "menu") {
-    hud.setVitals(player.hp, player.armor);
-    const ammoKey = `${player.active}:${player.gun.mag}/${player.gun.reserve}:${grenadeInHand || ""}`;
-    if (ammoKey !== lastHudAmmo) {
-      lastHudAmmo = ammoKey;
-      hud.setAmmo(player.gun, grenadeInHand ? `${GRENADES[grenadeInHand].name} IN HAND` : player.gun.def.name, player.grenades, player.hasBomb);
-    }
-    hud.setMoney(G.money);
-    const label = G.phase === "buy" ? `BUY — ROUND ${G.round}` : `ROUND ${G.round}`;
-    hud.setClock(G.phaseT, label, (G.phase === "live" && G.phaseT < 10) || G.phase === "planted");
-    hud.setPips(aliveCount("atk"), aliveCount("def"));
-    hud.setScore(G.score, G.round);
-    hud.setBombState(G.phase === "planted" ? `◆ CHARGE PLANTED — SITE ${G.bomb.site.id}` : G.bomb.state === "dropped" ? "◆ CHARGE DROPPED" : "");
-    hud.setSpread(6 + spreadFor(player.gun.def, player) * 620);
-    hud.setFlash(player.blindT > 0 ? Math.min(1, player.blindT / 1.6) : 0);
-    // contextual hint
-    let hint = "";
-    if (player.alive && player.hasBomb && G.phase === "live" &&
-        (inSite(W.sites.A, player.pos.x, player.pos.z) || inSite(W.sites.B, player.pos.x, player.pos.z))) {
-      hint = "Hold E to plant the charge";
-    } else if (!player.alive && G.phase !== "over" && G.phase !== "matchover") {
-      hint = "Spectating — the round plays out";
-    } else if ((G.phase === "live" || G.phase === "planted") && !input.locked && !G.director) {
-      hint = "Click the yard to take aim";
-    }
-    hud.setHint(hint);
-    // scoreboard while Tab is held
-    if (input.down("Tab")) {
-      const rows = [...G.combatants]
-        .sort((a, b) => b.kills - a.kills)
-        .map((c) => ({ name: c.name, team: c.team, kills: c.kills, deaths: c.deaths, money: c.isPlayer ? G.money : c.money, alive: c.alive }));
-      hud.renderScoreboard(rows);
-      hud.showScoreboard();
-    } else {
-      hud.hideScoreboard();
-    }
-    if (!G.channel || G.channel.who !== player) hud.setChannel(null);
-  }
-  hud.update(dt);
-  effects.update(dt, camera);
-  renderer.render(scene, camera);
-}
-
-// ---------------------------------------------------------------- boot + loop
-const params = new URLSearchParams(location.search);
-G.director = params.get("autoplay") === "1";
-// A play-test aid: ?timescale=N fast-forwards the fixed-step simulation
-// (used to stage screenshots and soak-test rounds on slow machines).
-const TIMESCALE = Math.max(1, Math.min(20, Number(params.get("timescale") ?? 1) || 1));
-
-// place everyone at their spawns for the menu backdrop
-{
-  let ai = 0, di = 0;
-  for (const c of G.combatants) {
-    const s = c.team === "atk" ? W.spawns.atk[ai++ % 4] : W.spawns.def[di++ % 4];
-    c.pos.set(s.x, 0, s.z);
-    c.yaw = s.yaw;
-    if (!c.isPlayer) c.syncMesh(0);
-  }
-}
-
-document.getElementById("play-btn").addEventListener("click", () => {
-  sound.unlock();
-  document.getElementById("menu").classList.add("hidden");
-  startMatch();
+// ---- boot, input plumbing, frame loop ---------------------------------------------
+initInput(renderer.domElement);
+HUD.initHUD((key) => {
+  if (G.phase === 'buy' && buyItem(player, key)) SFX.sfxBuy();
+  else SFX.sfxDeny();
 });
-document.getElementById("again-btn").addEventListener("click", () => {
-  document.getElementById("matchover").classList.add("hidden");
-  startMatch();
-});
-if (G.director) {
-  document.getElementById("menu").classList.add("hidden");
-  startMatch();
+const startscreen = document.getElementById('startscreen');
+let playing = AUTOPLAY;
+if (AUTOPLAY) {
+  startscreen.classList.add('done');
+  document.getElementById('hud').classList.remove('hidden');
+  initAudio();
 }
-
-addEventListener("resize", () => {
+startscreen.addEventListener('click', () => {
+  initAudio();
+  resumeAudio();
+  startscreen.classList.add('done');
+  document.getElementById('hud').classList.remove('hidden');
+  playing = true;
+  clearPresses();
+  renderer.domElement.requestPointerLock();
+});
+document.addEventListener('pointerlockchange', () => {
+  if (document.pointerLockElement !== renderer.domElement && playing && !AUTOPLAY) {
+    startscreen.classList.remove('done');
+    playing = false;
+  }
+});
+addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
 });
 
-const STEP = 1 / 60;
-let acc = 0;
-let lastTs = performance.now();
-function frame(ts) {
-  requestAnimationFrame(frame);
-  let delta = (ts - lastTs) / 1000;
-  lastTs = ts;
-  if (delta > 0.25) delta = 0.25;
-  acc += delta * TIMESCALE;
-  const maxSteps = 5 * TIMESCALE;
-  let steps = 0;
-  while (acc >= STEP && steps < maxSteps) {
-    if (G.phase !== "menu" && G.phase !== "matchover") step(STEP);
-    acc -= STEP;
-    steps++;
-  }
-  if (steps === maxSteps) acc = 0;
-  render(Math.min(delta, 0.05));
+function frameKeys() {
+  if (G.phase === 'buy' && playing) {
+    if (takePress('KeyB') || takePress('Escape')) HUD.setBuyOpen(!HUD.isBuyOpen());
+    if (HUD.isBuyOpen()) {
+      const codes = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9', 'Digit0'];
+      for (let i = 0; i < codes.length; i++) {
+        if (takePress(codes[i])) {
+          if (buyItem(player, BUY_KEYS[i])) SFX.sfxBuy(); else SFX.sfxDeny();
+        }
+      }
+    }
+  } else if (takePress('KeyB')) { /* swallow outside buy */ }
+  if (takePress('Tab')) HUD.setBoardOpen(true);
+  if (!down('Tab') && HUD.isBoardOpen()) HUD.setBoardOpen(false);
+  if (G.over && takePress('Enter')) startMatch();
+  if (!player.alive && mouse.clicked) spectateTarget = null; // re-pick below
 }
-requestAnimationFrame(frame);
+
+let last = performance.now() / 1000;
+let acc = 0;
+const EMPTY_M = { dx: 0, dy: 0, clicked: false, rightClicked: false, wheel: 0, rightDown: false, down: false };
+let firstFrame = true;
+
+function frame() {
+  requestAnimationFrame(frame);
+  const nowS = performance.now() / 1000;
+  let dt = Math.min(0.1, nowS - last);
+  last = nowS;
+  const renderDt = dt;
+  dt *= TIMESCALE;
+  frameKeys();
+  const m = consumeMouse();
+  if (playing || AUTOPLAY) {
+    acc += dt;
+    let first = true;
+    let guard = 0;
+    const maxSteps = 6 + Math.ceil(TIMESCALE * 6);
+    while (acc >= STEP && guard < maxSteps) {
+      simStep(STEP, first ? m : EMPTY_M);
+      first = false;
+      acc -= STEP;
+      guard++;
+    }
+    if (guard === maxSteps) acc = 0;
+  }
+  // visuals
+  for (const a of G.actors) syncBody(a, renderDt);
+  let scoped = false;
+  let spectating = null;
+  if (player.alive) {
+    scoped = updateCamera(player, camera, renderDt);
+    syncViewModel(player, renderDt);
+    camera.children.forEach((c) => { c.visible = true; });
+  } else {
+    // spectate a living teammate, cycling on click
+    const mates = G.actors.filter((x) => x.alive && x.team === player.team && !x.isPlayer);
+    if (!spectateTarget || !spectateTarget.alive) spectateTarget = mates[0] || null;
+    if (m.clicked && mates.length > 1) {
+      const i = mates.indexOf(spectateTarget);
+      spectateTarget = mates[(i + 1) % mates.length];
+    }
+    if (spectateTarget) {
+      scoped = updateCamera(spectateTarget, camera, renderDt);
+      spectating = spectateTarget.name;
+    } else {
+      camera.position.set(0, 55, 30);
+      camera.lookAt(0, 0, 0);
+      camera.fov = 60;
+      camera.updateProjectionMatrix();
+    }
+    camera.children.forEach((c) => { c.visible = false; });
+  }
+  // the charge prop follows its state
+  const b = G.bomb;
+  if (b.planted && b.pos) {
+    bombMesh.visible = true;
+    bombMesh.position.set(b.pos.x, 0.13, b.pos.z);
+    const rate = b.fuse > 12 ? 2 : b.fuse > 5 ? 5 : 11;
+    bombMesh.userData.lamp.material.emissiveIntensity = (Math.sin(nowS * rate * Math.PI) > 0 ? 2.6 : 0.2);
+  } else if (b.droppedAt) {
+    bombMesh.visible = true;
+    bombMesh.position.set(b.droppedAt.x, 0.13, b.droppedAt.z);
+    bombMesh.userData.lamp.material.emissiveIntensity = 1.4;
+  } else if (b.carrier) {
+    bombMesh.visible = true;
+    bombMesh.position.set(b.carrier.pos.x, b.carrier.pos.y + 1.28, b.carrier.pos.z);
+    bombMesh.rotation.y = b.carrier.yaw;
+  } else bombMesh.visible = false;
+  // alert lights breathe red over a planted site
+  for (const k of ['A', 'B']) {
+    const l = alertLights[k];
+    if (b.planted && b.site === k) l.intensity = 30 + 22 * Math.sin(nowS * 9);
+    else l.intensity = Math.max(0, l.intensity - renderDt * 60);
+  }
+  hurtT = Math.max(0, hurtT - renderDt);
+  updateEffects(renderDt, G.time);
+  HUD.updateHUD(renderDt, { playing: playing || AUTOPLAY, scoped, spectating, hurtT });
+  renderer.render(scene, camera);
+  if (firstFrame) {
+    firstFrame = false;
+    startMatch();
+  }
+}
+
+// Probes for local play-testing and screenshot staging: the game's own
+// state, read-only, so a headless driver can wait for real moments.
+window.__probe = () => ({
+  phase: G.phase, round: G.round + 1, time: Math.round(G.time * 10) / 10,
+  score: { ...G.squadScore }, planted: G.bomb.planted, fuse: Math.round(G.bomb.fuse),
+  aliveAtk: aliveOf('atk').length, aliveDef: aliveOf('def').length,
+  killfeed: G.killfeed.length, hp: Math.ceil(player.hp), money: player.money,
+  buyOpen: HUD.isBuyOpen(), playerAlive: player.alive, plan: G.planSite,
+  bots: G.actors.filter((a) => !a.isPlayer).map((a) => ({
+    n: a.name, t: a.team, st: a.brain ? a.brain.state : '-', hp: Math.ceil(a.hp),
+    x: Math.round(a.pos.x), z: Math.round(a.pos.z), bomb: a.hasBomb,
+  })),
+});
+frame();
